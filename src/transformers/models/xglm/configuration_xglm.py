@@ -126,7 +126,7 @@ class XGLMConfig(PretrainedConfig):
         self.init_std = init_std
         self.scale_embedding = scale_embedding  # scale factor will be sqrt(d_model) if True
         self.use_cache = use_cache
-
+        
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -134,6 +134,5 @@ class XGLMConfig(PretrainedConfig):
             decoder_start_token_id=decoder_start_token_id,
             **kwargs,
         )
-
 
 __all__ = ["XGLMConfig"]

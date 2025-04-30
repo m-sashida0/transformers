@@ -199,6 +199,10 @@ class XGLMAttention(nn.Module):
         dropout: float = 0.0,
         is_decoder: bool = False,
         bias: bool = True,
+        fix_layer: Optional[List[int]] = None,     # 追加
+        fix_head: Optional[List[int]] = None,       # 追加
+        layer_idx: Optional[int] = None,           # 追加: 現在の層番号。外部から設定してください。
+        fix_temperature: Optional[float] = None,            # 追加: 温度パラメータ
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -218,6 +222,11 @@ class XGLMAttention(nn.Module):
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+
+        self.fix_layer = fix_layer                # 追加
+        self.fix_head = fix_head                  # 追加
+        self.layer_idx = layer_idx                     # 追加: 現在の層番号。外部から設定してください。
+        self.fix_temperature = fix_temperature    # 追加: 温度パラメータ
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -296,6 +305,17 @@ class XGLMAttention(nn.Module):
             )
             attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
+        if (self.fix_layer is not None) and (self.fix_head is not None) and (self.layer_idx is not None) and (self.fix_temperature is not None):
+            # 4D に reshape
+            scores = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+            # fix_layer, fix_head, fix_temperature は同長リストと想定
+            for _fix_layer, _fix_head in zip(self.fix_layer, self.fix_head):
+                if self.layer_idx == _fix_layer:
+                    # 該当ヘッドのスコアだけ温度で割る
+                    scores[:, _fix_head, :, :] = scores[:, _fix_head, :, :] / self.fix_temperature
+            # 元の形に戻す
+            attn_weights = scores.view(bsz * self.num_heads, tgt_len, src_len)
+
         # upcast to fp32 if the weights are in fp16. Please see https://github.com/huggingface/transformers/pull/17437
         if attn_weights.dtype == torch.float16:
             attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(torch.float16)
@@ -310,6 +330,20 @@ class XGLMAttention(nn.Module):
                 )
             attn_weights = layer_head_mask.view(1, -1, 1, 1) * attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
             attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
+        if (self.fix_layer is not None) and (self.fix_head is not None) and (self.layer_idx is not None) and (self.fix_temperature is None):
+            for _fix_layer, _fix_head in zip(self.fix_layer, self.fix_head):
+                if self.layer_idx == _fix_layer:
+                    # 下三角行列（対角含む）を作成。各行 i で allowed な部分を均一化（各行で allowed 部分は 1/(i+1)）
+                    triangular = torch.tril(torch.ones((tgt_len, tgt_len), device=attn_weights.device))
+                    denom = triangular.sum(dim=-1, keepdim=True)  # 各行ごとの和（i+1）
+                    uniform_distribution = (triangular / denom).to(attn_weights.dtype)    # shape: [tgt_len, tgt_len]
+                    # 4D に reshape してから、対象ヘッドのみ直接代入
+                    attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
+                    # _fix_head 番目のヘッドに均一分布を展開して代入
+                    attn_weights[:, _fix_head, :, :] = uniform_distribution.unsqueeze(0).expand(bsz, tgt_len, src_len)
+                    # 元の 3D 形状に戻す
+                    attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)                    
+
 
         if output_attentions:
             # this operation is a bit awkward, but it's required to
@@ -344,7 +378,7 @@ class XGLMAttention(nn.Module):
 
 
 class XGLMDecoderLayer(nn.Module):
-    def __init__(self, config: XGLMConfig):
+    def __init__(self, config: XGLMConfig, layer_idx):
         super().__init__()
         self.embed_dim = config.d_model
 
@@ -353,6 +387,10 @@ class XGLMDecoderLayer(nn.Module):
             num_heads=config.attention_heads,
             dropout=config.attention_dropout,
             is_decoder=True,
+            fix_layer=config.fix_layer,     # 追加
+            fix_head=config.fix_head,       # 追加
+            layer_idx=layer_idx,           # 追加: 現在の層番号。外部から設定してください。
+            fix_temperature=config.fix_temperature,  # 追加: 温度パラメータ
         )
         self.dropout = config.dropout
         self.activation_fn = ACT2FN[config.activation_function]
@@ -364,6 +402,10 @@ class XGLMDecoderLayer(nn.Module):
                 num_heads=config.attention_heads,
                 dropout=config.attention_dropout,
                 is_decoder=True,
+                fix_layer=config.fix_layer,     # 追加
+                fix_head=config.fix_head,       # 追加
+                layer_idx=layer_idx,           # 追加: 現在の層番号。外部から設定してください。
+                fix_temperature=config.fix_temperature,  # 追加: 温度パラメータ
             )
             self.encoder_attn_layer_norm = nn.LayerNorm(self.embed_dim)
 
@@ -383,7 +425,7 @@ class XGLMDecoderLayer(nn.Module):
         cross_attn_layer_head_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: Optional[bool] = False,
-        use_cache: Optional[bool] = True,
+        use_cache: Optional[bool] = False,
     ) -> torch.Tensor:
         """
         Args:
@@ -514,7 +556,13 @@ class XGLMModel(XGLMPreTrainedModel):
             config.d_model,
             config.pad_token_id,
         )
-        self.layers = nn.ModuleList([XGLMDecoderLayer(config) for _ in range(config.num_layers)])
+        self.layers = nn.ModuleList([XGLMDecoderLayer(config, layer_idx=i) for i in range(config.num_layers)])
+        for idx, layer in enumerate(self.layers):
+            # 各レイヤーの self_attn に層番号をセット
+            layer.self_attn.layer_idx = idx
+            # もし encoder_attn が存在する場合は、同様にセット
+            if hasattr(layer, "encoder_attn"):
+                layer.encoder_attn.layer_idx = idx
         self.layer_norm = nn.LayerNorm(config.d_model)
 
         self.gradient_checkpointing = False
