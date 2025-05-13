@@ -158,7 +158,10 @@ def eager_attention_forward(module, query, key, value, attention_mask, head_mask
 
 
 class GPT2Attention(nn.Module):
-    def __init__(self, config, is_cross_attention=False, layer_idx=None):
+    def __init__(self, config, is_cross_attention=False, layer_idx=None,
+            fix_layer: Optional[List[int]] = None,     # 追加
+            fix_head: Optional[List[int]] = None,       # 追加
+            fix_temperature: Optional[List[int]] = None, # 追加):
         super().__init__()
         self.config = config
         max_positions = config.max_position_embeddings
@@ -186,7 +189,10 @@ class GPT2Attention(nn.Module):
 
         # Layer-wise attention scaling, reordering, and upcasting
         self.scale_attn_by_inverse_layer_idx = config.scale_attn_by_inverse_layer_idx
+        self.fix_layer = fix_layer                # 追加
+        self.fix_head = fix_head                  # 追加
         self.layer_idx = layer_idx
+        self.fix_temperature = fix_temperature      # 追加
         self.reorder_and_upcast_attn = config.reorder_and_upcast_attn
 
         if self.is_cross_attention:
@@ -349,6 +355,29 @@ class GPT2Attention(nn.Module):
                 **kwargs,
             )
 
+        if (self.fix_layer is not None
+            and self.fix_head is not None
+            and self.layer_idx is not None
+        ):
+            bsz, num_heads, tgt_len, src_len = attn_weights.shape
+
+            if self.fix_temperature is not None:
+                # 温度スケーリング
+                for _fix_layer, _fix_head in zip(self.fix_layer, self.fix_head):
+                    if self.layer_idx == _fix_layer:
+                        attn_weights[:, _fix_head, :, :] /= self.fix_temperature
+
+            else:
+                # 均一分布で上書き
+                triangular = torch.tril(torch.ones((tgt_len, src_len), device=attn_weights.device))
+                uniform_distribution = (triangular / triangular.sum(dim=-1, keepdim=True)).to(attn_weights.dtype)
+                for _fix_layer, _fix_head in zip(self.fix_layer, self.fix_head):
+                    if self.layer_idx == _fix_layer:
+                        attn_weights[:, _fix_head, :, :] = uniform_distribution.unsqueeze(0).expand(bsz, tgt_len, src_len)
+
+            # softmax を再適用（通常は softmax 済みで返ってくるので注意）
+            attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
+
         attn_output = attn_output.reshape(*attn_output.shape[:-2], -1).contiguous()
         attn_output = self.c_proj(attn_output)
         attn_output = self.resid_dropout(attn_output)
@@ -380,11 +409,11 @@ class GPT2Block(nn.Module):
         inner_dim = config.n_inner if config.n_inner is not None else 4 * hidden_size
 
         self.ln_1 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
-        self.attn = GPT2Attention(config=config, layer_idx=layer_idx)
+        self.attn = GPT2Attention(config=config, layer_idx=layer_idx, fix_layer=config.fix_layer, fix_head=config.fix_head, fix_temperature=config.fix_temperature)
         self.ln_2 = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
         if config.add_cross_attention:
-            self.crossattention = GPT2Attention(config=config, is_cross_attention=True, layer_idx=layer_idx)
+            self.crossattention = GPT2Attention(config=config, is_cross_attention=True, layer_idx=layer_idx, fix_layer=config.fix_layer, fix_head=config.fix_head, fix_temperature=config.fix_temperature)
             self.ln_cross_attn = nn.LayerNorm(hidden_size, eps=config.layer_norm_epsilon)
 
         self.mlp = GPT2MLP(inner_dim, config)
