@@ -19,7 +19,8 @@ import math
 import os
 import warnings
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple, Union
+from typing import Callable, Optional, Tuple, Union, List
+
 
 import torch
 import torch.utils.checkpoint
@@ -147,6 +148,24 @@ def eager_attention_forward(module, query, key, value, attention_mask, head_mask
     attn_weights = attn_weights.type(value.dtype)
     attn_weights = module.attn_dropout(attn_weights)
 
+    if getattr(module, "fix_layer", None) is not None and module.layer_idx is not None:
+        for fix_layer, fix_head in zip(module.fix_layer, module.fix_head):
+            if module.layer_idx == fix_layer:
+                # 温度スケーリング or 均一三角分布に置き換え
+                bsz, n_heads, tgt_len, src_len = attn_weights.shape
+                if module.fix_temperature is not None:
+                    # module.fix_temperature はリストで対応させている前提
+                    idx = module.fix_layer.index(fix_layer)
+                    attn_weights[:, fix_head, :, :] /= module.fix_temperature[idx]
+                else:
+                    # 下三角ユニフォーム分布に置き換え
+                    tri = torch.tril(torch.ones((tgt_len, src_len), device=attn_weights.device))
+                    uni = tri / tri.sum(dim=-1, keepdim=True)
+                    attn_weights[:, fix_head, :, :] = uni.unsqueeze(0).expand(bsz, tgt_len, src_len)
+        # softmax を再適用
+        attn_weights = attn_weights + causal_mask
+        attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
+
     # Mask heads if we want to
     if head_mask is not None:
         attn_weights = attn_weights * head_mask
@@ -161,7 +180,8 @@ class GPT2Attention(nn.Module):
     def __init__(self, config, is_cross_attention=False, layer_idx=None,
             fix_layer: Optional[List[int]] = None,     # 追加
             fix_head: Optional[List[int]] = None,       # 追加
-            fix_temperature: Optional[List[int]] = None, # 追加):
+            fix_temperature: Optional[List[int]] = None, # 追加
+            ):
         super().__init__()
         self.config = config
         max_positions = config.max_position_embeddings
@@ -325,18 +345,18 @@ class GPT2Attention(nn.Module):
 
         using_eager = self.config._attn_implementation == "eager"
         attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            if self.config._attn_implementation == "sdpa" and (output_attentions or head_mask is not None):
-                using_eager = True
-                logger.warning_once(
-                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
-                    'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
-                )
-            else:
-                # Attention functions are consistent with previous equivalent attention classes, however they do not support some options
-                # (e.g. layer scaling, head mask) that eager supports. These implementations are thus equivalent to previous code, but
-                # not necessarily to eager (if mentioned options are provided).
-                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        # if self.config._attn_implementation != "eager":
+        #     if self.config._attn_implementation == "sdpa" and (output_attentions or head_mask is not None):
+        #         using_eager = True
+        #         logger.warning_once(
+        #             "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
+        #             'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+        #         )
+        #     else:
+        #         # Attention functions are consistent with previous equivalent attention classes, however they do not support some options
+        #         # (e.g. layer scaling, head mask) that eager supports. These implementations are thus equivalent to previous code, but
+        #         # not necessarily to eager (if mentioned options are provided).
+        #         attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         if using_eager and self.reorder_and_upcast_attn:
             attn_output, attn_weights = self._upcast_and_reordered_attn(
@@ -354,29 +374,6 @@ class GPT2Attention(nn.Module):
                 is_causal=is_causal,
                 **kwargs,
             )
-
-        if (self.fix_layer is not None
-            and self.fix_head is not None
-            and self.layer_idx is not None
-        ):
-            bsz, num_heads, tgt_len, src_len = attn_weights.shape
-
-            if self.fix_temperature is not None:
-                # 温度スケーリング
-                for _fix_layer, _fix_head in zip(self.fix_layer, self.fix_head):
-                    if self.layer_idx == _fix_layer:
-                        attn_weights[:, _fix_head, :, :] /= self.fix_temperature
-
-            else:
-                # 均一分布で上書き
-                triangular = torch.tril(torch.ones((tgt_len, src_len), device=attn_weights.device))
-                uniform_distribution = (triangular / triangular.sum(dim=-1, keepdim=True)).to(attn_weights.dtype)
-                for _fix_layer, _fix_head in zip(self.fix_layer, self.fix_head):
-                    if self.layer_idx == _fix_layer:
-                        attn_weights[:, _fix_head, :, :] = uniform_distribution.unsqueeze(0).expand(bsz, tgt_len, src_len)
-
-            # softmax を再適用（通常は softmax 済みで返ってくるので注意）
-            attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
 
         attn_output = attn_output.reshape(*attn_output.shape[:-2], -1).contiguous()
         attn_output = self.c_proj(attn_output)
