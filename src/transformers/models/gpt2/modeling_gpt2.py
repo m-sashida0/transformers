@@ -163,8 +163,8 @@ def eager_attention_forward(module, query, key, value, attention_mask, head_mask
                     uni = tri / tri.sum(dim=-1, keepdim=True)
                     attn_weights[:, fix_head, :, :] = uni.unsqueeze(0).expand(bsz, tgt_len, src_len)
         # softmax を再適用
-        attn_weights = attn_weights + causal_mask
-        attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
+        # attn_weights = attn_weights + causal_mask
+        # attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
 
     # Mask heads if we want to
     if head_mask is not None:
