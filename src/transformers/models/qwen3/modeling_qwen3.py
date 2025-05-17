@@ -19,7 +19,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Callable, Optional, Tuple, Union
+from typing import Callable, Optional, Tuple, Union, List
 
 import torch
 from torch import nn
@@ -169,6 +169,22 @@ def eager_attention_forward(
 
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
     attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+
+    if getattr(module, "fix_layer", None) is not None and module.layer_idx is not None:
+        for fix_layer, fix_head in zip(module.fix_layer, module.fix_head):
+            if module.layer_idx == fix_layer:
+                # 温度スケーリング or 均一三角分布に置き換え
+                bsz, n_heads, tgt_len, src_len = attn_weights.shape
+                if module.fix_temperature is not None:
+                    # module.fix_temperature はリストで対応させている前提
+                    idx = module.fix_layer.index(fix_layer)
+                    attn_weights[:, fix_head, :, :] /= module.fix_temperature[idx]
+                else:
+                    # 下三角ユニフォーム分布に置き換え
+                    tri = torch.tril(torch.ones((tgt_len, src_len), device=attn_weights.device))
+                    uni = tri / tri.sum(dim=-1, keepdim=True)
+                    attn_weights[:, fix_head, :, :] = uni.unsqueeze(0).expand(bsz, tgt_len, src_len)
+
     attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
 
@@ -178,7 +194,11 @@ def eager_attention_forward(
 class Qwen3Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: Qwen3Config, layer_idx: int):
+    def __init__(self, config: Qwen3Config, layer_idx: int,
+        fix_layer: Optional[List[int]] = None,     # 追加
+        fix_head: Optional[List[int]] = None,       # 追加
+        fix_temperature: Optional[float] = None,            # 追加: 温度パラメータ
+    ):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -187,6 +207,9 @@ class Qwen3Attention(nn.Module):
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
         self.is_causal = True
+        self.fix_layer = fix_layer
+        self.fix_head = fix_head
+        self.fix_temperature = fix_temperature
 
         self.q_proj = nn.Linear(
             config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
@@ -235,14 +258,14 @@ class Qwen3Attention(nn.Module):
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
-                logger.warning_once(
-                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
-                    'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
-                )
-            else:
-                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        # if self.config._attn_implementation != "eager":
+        #     if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
+        #         logger.warning_once(
+        #             "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
+        #             'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+        #         )
+        #     else:
+        #         attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -265,7 +288,7 @@ class Qwen3DecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = Qwen3Attention(config=config, layer_idx=layer_idx)
+        self.self_attn = Qwen3Attention(config=config, layer_idx=layer_idx, fix_layer=config.fix_layer, fix_head=config.fix_head, fix_temperature=config.fix_temperature)
         self.mlp = Qwen3MLP(config)
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

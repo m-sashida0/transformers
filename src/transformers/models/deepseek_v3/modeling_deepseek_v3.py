@@ -5,7 +5,7 @@
 #                          modular_deepseek_v3.py file directly. One of our CI enforces this.
 #                🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨🚨
 import math
-from typing import Callable, Optional, Tuple, Union
+from typing import Callable, Optional, Tuple, Union, List
 
 import torch
 import torch.nn.functional as F
@@ -284,6 +284,22 @@ def eager_attention_forward(
 
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
     attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+
+    if getattr(module, "fix_layer", None) is not None and module.layer_idx is not None:
+    for fix_layer, fix_head in zip(module.fix_layer, module.fix_head):
+        if module.layer_idx == fix_layer:
+            # 温度スケーリング or 均一三角分布に置き換え
+            bsz, n_heads, tgt_len, src_len = attn_weights.shape
+            if module.fix_temperature is not None:
+                # module.fix_temperature はリストで対応させている前提
+                idx = module.fix_layer.index(fix_layer)
+                attn_weights[:, fix_head, :, :] /= module.fix_temperature[idx]
+            else:
+                # 下三角ユニフォーム分布に置き換え
+                tri = torch.tril(torch.ones((tgt_len, src_len), device=attn_weights.device))
+                uni = tri / tri.sum(dim=-1, keepdim=True)
+                attn_weights[:, fix_head, :, :] = uni.unsqueeze(0).expand(bsz, tgt_len, src_len)
+
     attn_output = torch.matmul(attn_weights, value_states)
     attn_output = attn_output.transpose(1, 2).contiguous()
 
@@ -337,7 +353,11 @@ def yarn_get_mscale(scale=1, mscale=1):
 class DeepseekV3Attention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: DeepseekV3Config, layer_idx: int):
+    def __init__(self, config: DeepseekV3Config, layer_idx: int,
+            fix_layer: Optional[List[int]] = None,     # 追加
+            fix_head: Optional[List[int]] = None,       # 追加
+            fix_temperature: Optional[List[int]] = None, # 追加
+            ):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -351,6 +371,9 @@ class DeepseekV3Attention(nn.Module):
         self.v_head_dim = config.v_head_dim
         self.qk_nope_head_dim = config.qk_nope_head_dim
         self.qk_head_dim = config.qk_head_dim
+        self.fix_layer = fix_layer
+        self.fix_head = fix_head
+        self.fix_temperature = fix_temperature
 
         self.is_causal = True
         self.q_a_proj = nn.Linear(config.hidden_size, config.q_lora_rank, bias=config.attention_bias)
@@ -426,14 +449,14 @@ class DeepseekV3Attention(nn.Module):
             value_states = F.pad(value_states, [0, self.qk_head_dim - self.v_head_dim])
 
         attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
-                logger.warning_once(
-                    "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
-                    'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
-                )
-            else:
-                attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        # if self.config._attn_implementation != "eager":
+        #     if self.config._attn_implementation == "sdpa" and kwargs.get("output_attentions", False):
+        #         logger.warning_once(
+        #             "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
+        #             'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+        #         )
+        #     else:
+        #         attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -459,7 +482,7 @@ class DeepseekV3DecoderLayer(GradientCheckpointingLayer):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        self.self_attn = DeepseekV3Attention(config=config, layer_idx=layer_idx)
+        self.self_attn = DeepseekV3Attention(config=config, layer_idx=layer_idx, fix_layer=config.fix_layer, fix_head=config.fix_head, fix_temperature=config.fix_temperature)
 
         if layer_idx >= config.first_k_dense_replace:
             self.mlp = DeepseekV3MoE(config)
